@@ -14,7 +14,8 @@ public static class WarehouseEnpoint
     private static async Task<IResult> AddProductWarehouse(int idProduct, int idWarehouse, int amount, DateTime date,
         IDbService service, IConfiguration configuration)
     {
-        var id = await service.AddWarehouseProduct(idProduct, idWarehouse, amount, date);
+        // var id = await service.AddWarehouseProduct(idProduct, idWarehouse, amount, date);
+        var id = await service.AddWarehouseProductAsync(idProduct, idWarehouse, amount, date);
         return id is null ? Results.BadRequest() : Results.Ok(id);
     }
 }

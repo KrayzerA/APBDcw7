@@ -1,5 +1,6 @@
 using System.Data;
 using System.Data.SqlClient;
+using System.Transactions;
 using cw7.DTOs;
 using cw7.Models;
 using Dapper;
@@ -13,6 +14,7 @@ public interface IDbService
     Task<Warehouse?> GetWarehouse(int id);
     Task<Order?> GetOrderWithProduct(int idProduct, int amount, DateTime data);
     Task<int?> AddWarehouseProduct(int idProduct, int idWarehouse, int amount, DateTime date);
+    Task<int?> AddWarehouseProductAsync(int idProduct, int idWarehouse, int amount, DateTime date);
 }
 
 public class DbService(IConfiguration configuration) : IDbService
@@ -41,7 +43,7 @@ public class DbService(IConfiguration configuration) : IDbService
             return null;
         }
 
-        reader.Read();
+        await reader.ReadAsync();
 
         return new Product
         {
@@ -64,7 +66,7 @@ public class DbService(IConfiguration configuration) : IDbService
             return null;
         }
 
-        reader.Read();
+        await reader.ReadAsync();
         
         return new Order
         {
@@ -88,7 +90,7 @@ public class DbService(IConfiguration configuration) : IDbService
             return null;
         }
 
-        reader.Read();
+        await reader.ReadAsync();
         return new Warehouse
         {
             IdWarehouse = id,
@@ -112,7 +114,7 @@ public class DbService(IConfiguration configuration) : IDbService
             return null;
         }
 
-        reader.Read();
+        await reader.ReadAsync();
         return new Order
         {
             IdOrder = reader.GetInt32(0),
@@ -122,14 +124,15 @@ public class DbService(IConfiguration configuration) : IDbService
         };
     }
 
-    private async Task<int?> CheckProductWarehouse(int idOrder)
+    private async Task<Boolean> CheckProductWarehouse(int idOrder)
     {
         await using var connection = await GetConnection();
 
         var com = new SqlCommand("select pw.IdProductWarehouse from Product_Warehouse pw where IdOrder = @1", connection);
         com.Parameters.AddWithValue("@1", idOrder);
-        var affected = await com.ExecuteNonQueryAsync();
-        return affected;
+        var reader = await com.ExecuteReaderAsync();
+        
+        return reader.HasRows;
     }
 
     public async Task<int?> AddWarehouseProduct(int idProduct, int idWarehouse, int amount, DateTime date)
@@ -158,26 +161,151 @@ public class DbService(IConfiguration configuration) : IDbService
             return null;
         }
 
-        var checkWarehouse = await CheckProductWarehouse(order.IdOrder);
-        if (checkWarehouse > 0)
+        if (await CheckProductWarehouse(order.IdOrder))
         {
             return null;
         }
         
         await using var connection = await GetConnection();
+        var tran = await connection.BeginTransactionAsync();
         
-        var com = new SqlCommand("INSERT INTO Product_Warehouse VALUES (@1,@2,@3,@4,@5,@6);" +
-                                 "SELECT CAST(scope_identity() as int)", connection);
-        com.Parameters.AddWithValue("@1", idWarehouse);
-        com.Parameters.AddWithValue("@2", idProduct);
-        com.Parameters.AddWithValue("@3", order.IdOrder);
-        com.Parameters.AddWithValue("@4", amount);
-        com.Parameters.AddWithValue("@5", amount * product.Price);
-        com.Parameters.AddWithValue("@6", DateTime.Today);
+        try
+        {
+            var com = new SqlCommand("INSERT INTO Product_Warehouse VALUES (@1,@2,@3,@4,@5,@6);" +
+                                     "SELECT CAST(scope_identity() as int)", connection, (SqlTransaction)tran);
+            com.Parameters.AddWithValue("@1", idWarehouse);
+            com.Parameters.AddWithValue("@2", idProduct);
+            com.Parameters.AddWithValue("@3", order.IdOrder);
+            com.Parameters.AddWithValue("@4", amount);
+            com.Parameters.AddWithValue("@5", amount * product.Price);
+            com.Parameters.AddWithValue("@6", DateTime.Now);
+
+            var id = (int)(await com.ExecuteScalarAsync())!;
+            
+            com.Parameters.Clear();
+            com.CommandText = "UPDATE [Order] SET FulfilledAt = @1 WHERE IdOrder = @2";
+            com.Parameters.AddWithValue("@1", DateTime.Now);
+            com.Parameters.AddWithValue("@2", order.IdOrder);
+            var affected = await com.ExecuteNonQueryAsync();
+            if (affected == 0)
+            {
+                await tran.RollbackAsync();
+                return null;
+            }
+
+            await tran.CommitAsync();
+            return id;
+        }
+        catch (Exception)
+        {
+            await tran.RollbackAsync();
+            return null;
+        }
+    }
+
+    public async Task<int?> AddWarehouseProductAsync(int idProduct, int idWarehouse, int amount, DateTime date)
+    {
+        if (amount <= 0)
+        {
+            return null;
+        }
         
-        var id = (int)(await com.ExecuteScalarAsync())!;
+        await using var connection = await GetConnection();
+        var tran = await connection.BeginTransactionAsync();
 
-        return id;
+        try
+        {
+            var com = new SqlCommand("SELECT p.Name, p.Description, p.Price FROM Product p WHERE IdProduct = @1",
+                connection, (SqlTransaction)tran);
+            com.Parameters.AddWithValue("@1", idProduct);
 
+            var reader = await com.ExecuteReaderAsync();
+            if (!reader.HasRows) return null;
+
+            await reader.ReadAsync();
+            var product = new Product
+            {
+                IdProduct = idProduct,
+                Name = reader.GetString(0),
+                Description = reader.GetString(1),
+                Price = reader.GetDecimal(2)
+            };
+
+            com.Parameters.Clear();
+            com.CommandText = "SELECT w.Name, w.Address FROM Warehouse w WHERE IdWarehouse = @1";
+            com.Parameters.AddWithValue("@1", idWarehouse);
+            
+            if (!reader.IsClosed) await reader.CloseAsync();
+            reader = await com.ExecuteReaderAsync();
+            if (!reader.HasRows) return null;
+
+            await reader.ReadAsync();
+            var warehouse = new Warehouse
+            {
+                IdWarehouse = idWarehouse,
+                Name = reader.GetString(0),
+                Address = reader.GetString(1)
+            };
+            
+            com.Parameters.Clear();
+            com.CommandText = "Select o.IdOrder, o.IdProduct, o.Amount, o.CreatedAt, o.FulfilledAt FROM [Order] o " +
+                              "WHERE IdProduct = @1 and Amount = @2 and CreatedAt < @3 and FulfilledAt IS NULL";
+            com.Parameters.AddWithValue("@1",idProduct);
+            com.Parameters.AddWithValue("@2",amount);
+            com.Parameters.AddWithValue("@3",date);
+            
+            if (!reader.IsClosed) await reader.CloseAsync();
+            reader = await com.ExecuteReaderAsync();
+            if (!reader.HasRows) return null;
+            
+            await reader.ReadAsync();
+            var order = new Order
+            {
+                IdOrder = reader.GetInt32(0),
+                IdProduct = reader.GetInt32(1),
+                Amount = reader.GetInt32(2),
+                CreatedAt = reader.GetDateTime(3)
+
+            };
+            com.Parameters.Clear();
+            com.CommandText = "SELECT 1 FROM Product_Warehouse WHERE IdOrder = @1";
+            com.Parameters.AddWithValue("@1", order.IdOrder);
+            
+            if (!reader.IsClosed) await reader.CloseAsync();
+            reader = await com.ExecuteReaderAsync();
+            if (reader.HasRows) return null;
+            
+            com.Parameters.Clear();
+            com.CommandText = "UPDATE [Order] SET FulfilledAt = @1 WHERE IdOrder = @2";
+            com.Parameters.AddWithValue("@1", DateTime.Now);
+            com.Parameters.AddWithValue("@2", order.IdOrder);
+            
+            if (!reader.IsClosed) await reader.CloseAsync();
+            var affected = await com.ExecuteNonQueryAsync();
+            if (affected == 0) return null;
+            
+            com.Parameters.Clear();
+            com.CommandText = "INSERT INTO Product_Warehouse VALUES (@1,@2,@3,@4,@5,@6);" +
+                              "SELECT CAST(scope_identity() as int)";
+            com.Parameters.AddWithValue("@1", idWarehouse);
+            com.Parameters.AddWithValue("@2", idProduct);
+            com.Parameters.AddWithValue("@3", order.IdOrder);
+            com.Parameters.AddWithValue("@4", amount);
+            com.Parameters.AddWithValue("@5", amount * product.Price);
+            com.Parameters.AddWithValue("@6", DateTime.Now);
+            
+            if (!reader.IsClosed) await reader.CloseAsync();
+            var id = (int)(await com.ExecuteScalarAsync())!;
+            
+            await reader.CloseAsync();
+            await tran.CommitAsync();
+            return id;
+
+        }
+        catch (Exception)
+        {
+            await tran.RollbackAsync();
+            throw;
+        }
     }
 }
